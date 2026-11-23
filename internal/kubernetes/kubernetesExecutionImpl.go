@@ -208,13 +208,32 @@ func (s *stdinProxyReader) Read(b []byte) (n int, err error) {
 	return 1, nil
 }
 
+// pidGatedReader holds input back until the agent has reported the PID. A terminal echoes input,
+// so input arriving earlier would be echoed in front of the PID and read in its place.
+type pidGatedReader struct {
+	backend     io.Reader
+	pidReported <-chan struct{}
+	done        <-chan struct{}
+}
+
+func (g *pidGatedReader) Read(b []byte) (int, error) {
+	select {
+	case <-g.pidReported:
+		return g.backend.Read(b)
+	case <-g.done:
+		return 0, io.EOF
+	}
+}
+
 type stdoutProxyWriter struct {
-	backend    io.Writer
-	pidChannel chan uint32
-	pidRead    bool
-	lock       *sync.Mutex
-	buf        *bytes.Buffer
-	tty        bool
+	backend     io.Writer
+	pidChannel  chan uint32
+	pidReported chan struct{}
+	pidRead     bool
+	lock        *sync.Mutex
+	buf         *bytes.Buffer
+	tty         bool
+	session     bool
 }
 
 func (s *stdoutProxyWriter) Write(p []byte) (n int, err error) {
@@ -224,27 +243,55 @@ func (s *stdoutProxyWriter) Write(p []byte) (n int, err error) {
 		return s.backend.Write(p)
 	}
 	// Read the pid. See https://github.com/containerssh/agent for details.
-	// We need 6 bytes because the first 2 bytes will be \r\n from the --wait function injected in the reader above.
 	if n, err := s.buf.Write(p); err != nil {
 		return n, err
 	}
-	if (s.tty && s.buf.Len() >= 6) || (!s.tty && s.buf.Len() >= 4) {
-		bufferBytes := s.buf.Bytes()
-		s.pidRead = true
-		s.buf = nil
-		pidBytes := bufferBytes[:4]
-		pid := binary.LittleEndian.Uint32(pidBytes)
-		s.pidChannel <- pid
-		remainingBytes := bufferBytes[4:]
-		if len(remainingBytes) > 0 {
-			_, err := s.backend.Write(remainingBytes)
-			return len(p), err
-		} else {
-			return len(p), nil
-		}
-	} else {
+	pidBytes, consumed, ok := s.parsePID(s.buf.Bytes())
+	if !ok {
 		return len(p), nil
 	}
+	remainingBytes := s.buf.Bytes()[consumed:]
+	s.pidRead = true
+	s.buf = nil
+	s.pidChannel <- binary.LittleEndian.Uint32(pidBytes)
+	close(s.pidReported)
+	if len(remainingBytes) > 0 {
+		_, err := s.backend.Write(remainingBytes)
+		return len(p), err
+	}
+	return len(p), nil
+}
+
+// parsePID returns the 4 PID bytes at the start of buf and how many bytes of buf they take up, or
+// false when buf does not hold them all yet.
+func (s *stdoutProxyWriter) parsePID(buf []byte) ([]byte, int, bool) {
+	if s.session {
+		// We need 6 bytes because the first 2 bytes will be \r\n from the --wait function injected in the reader above.
+		if (s.tty && len(buf) >= 6) || (!s.tty && len(buf) >= 4) {
+			return buf[:4], 4, true
+		}
+		return nil, 0, false
+	}
+	if !s.tty {
+		if len(buf) >= 4 {
+			return buf[:4], 4, true
+		}
+		return nil, 0, false
+	}
+	// A terminal's output processing (ONLCR) writes every \n as \r\n, a 0x0a byte of the PID included.
+	pid := make([]byte, 0, 4)
+	i := 0
+	for len(pid) < 4 {
+		if i >= len(buf) || (buf[i] == '\r' && i+1 >= len(buf)) {
+			return nil, 0, false
+		}
+		if buf[i] == '\r' && buf[i+1] == '\n' {
+			i++
+		}
+		pid = append(pid, buf[i])
+		i++
+	}
+	return pid, i, true
 }
 
 func (k *kubernetesExecutionImpl) run(
@@ -256,19 +303,29 @@ func (k *kubernetesExecutionImpl) run(
 ) {
 	pidChannel := make(chan uint32)
 	if !k.pod.config.Pod.DisableAgent {
-		if k.pod.config.Pod.Mode == config.KubernetesExecutionModeSession {
+		session := k.pod.config.Pod.Mode == config.KubernetesExecutionModeSession
+		pidReported := make(chan struct{})
+		if session {
 			stdin = &stdinProxyReader{
 				backend: stdin,
 				lock:    &sync.Mutex{},
 				tty:     k.tty,
 			}
+		} else if k.tty {
+			stdin = &pidGatedReader{
+				backend:     stdin,
+				pidReported: pidReported,
+				done:        k.doneChan,
+			}
 		}
 		stdout = &stdoutProxyWriter{
-			tty:        k.tty,
-			backend:    stdout,
-			lock:       &sync.Mutex{},
-			pidChannel: pidChannel,
-			buf:        &bytes.Buffer{},
+			tty:         k.tty,
+			session:     session,
+			backend:     stdout,
+			lock:        &sync.Mutex{},
+			pidChannel:  pidChannel,
+			pidReported: pidReported,
+			buf:         &bytes.Buffer{},
 		}
 	}
 	go k.handleStream(stdin, stdout, stderr, closeWrite, onExit)
