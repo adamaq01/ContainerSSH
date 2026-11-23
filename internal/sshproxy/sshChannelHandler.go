@@ -22,6 +22,7 @@ type sshChannelHandler struct {
 	started           bool
 	logger            log.Logger
 	done              chan struct{}
+	outputDone        chan struct{}
 	exited            bool
 	ssh               *sshConnectionHandler
 }
@@ -36,6 +37,9 @@ func (s *sshChannelHandler) handleBackendClientRequests(
 		select {
 		case request, ok = <-requests:
 			if !ok {
+				if !s.waitForOutput() {
+					return
+				}
 				s.lock.Lock()
 				s.logger.Debug(message.NewMessage(message.MSSHProxyBackendSessionClosed, "Backend closed session."))
 				if err := s.session.Close(); err != nil && !errors.Is(err, io.EOF) {
@@ -46,6 +50,9 @@ func (s *sshChannelHandler) handleBackendClientRequests(
 				return
 			}
 		case <-s.done:
+			return
+		}
+		if (request.Type == "exit-status" || request.Type == "exit-signal") && !s.waitForOutput() {
 			return
 		}
 		s.lock.Lock()
@@ -61,6 +68,21 @@ func (s *sshChannelHandler) handleBackendClientRequests(
 			}
 		}
 		s.lock.Unlock()
+	}
+}
+
+func (s *sshChannelHandler) waitForOutput() bool {
+	s.lock.Lock()
+	outputDone := s.outputDone
+	s.lock.Unlock()
+	if outputDone == nil {
+		return true
+	}
+	select {
+	case <-outputDone:
+		return true
+	case <-s.done:
+		return false
 	}
 }
 
@@ -112,6 +134,7 @@ func (s *sshChannelHandler) streamStdio() error {
 		return err
 	}
 	s.started = true
+	s.outputDone = make(chan struct{})
 	go s.streamStdin()
 	outWg := &sync.WaitGroup{}
 	outWg.Add(2)
@@ -131,6 +154,7 @@ func (s *sshChannelHandler) closeOnOutputComplete(outWg *sync.WaitGroup) {
 			),
 		)
 	}
+	close(s.outputDone)
 }
 
 func (s *sshChannelHandler) streamStderr(outWg *sync.WaitGroup) {
@@ -159,7 +183,7 @@ func (s *sshChannelHandler) streamStdin() {
 			s.logger.Debug(message.Wrap(err, message.ESSHProxyStdinError, "Error copying stdin"))
 		}
 	}
-	s.logger.Debug(message.NewMessage(message.MSSHProxySessionClose, "Stdin complete, closing backing session channel..."))
+	s.logger.Debug(message.NewMessage(message.MSSHProxySessionClose, "Stdin complete, closing backing session channel for writing..."))
 	if err := s.backingChannel.CloseWrite(); err != nil && !errors.Is(err, io.EOF) {
 		s.logger.Debug(
 			message.NewMessage(
@@ -167,16 +191,6 @@ func (s *sshChannelHandler) streamStdin() {
 				"Failed to close the backend SSH channel for writing.",
 			),
 		)
-	}
-	if err := s.backingChannel.Close(); err != nil && !errors.Is(err, io.EOF) {
-		s.logger.Debug(
-			message.NewMessage(
-				message.ESSHProxySessionCloseFailed,
-				"Failed to close the backend SSH channel.",
-			),
-		)
-	} else {
-		s.logger.Debug(message.NewMessage(message.MSSHProxySessionClosed, "Closed backing session channel."))
 	}
 }
 
